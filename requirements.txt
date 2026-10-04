@@ -1,0 +1,5 @@
+discord.py
+aiohttp
+cryptography
+anthropic
+python-dotenv
