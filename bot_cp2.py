@@ -237,18 +237,18 @@ async def extract_names_from_image(image_bytes: bytes, members: dict, media_type
                     await asyncio.sleep(5 * (tentativa + 1))
                     continue
                 raise Exception(f"API erro {resp.status}: {result.get('error', {}).get('message', str(result))}")
-            text = result["content"][0]["text"].strip().replace("```json", "").replace("```", "").strip()
-            try:
-                names = json.loads(text)
-            except json.JSONDecodeError:
-                match = re.search(r'\[[\s\S]*?\]', text)
-                if match:
-                    names = json.loads(match.group(0))
-                else:
-                    raise Exception(f"Resposta inválida: {text[:200]}")
-            if not isinstance(names, list):
-                names = []  # resposta null/vazia: imagem sem painel de party, nenhum nome a extrair
-            return [n.strip() for n in names if isinstance(n, str) and n.strip()]
+    text = result["content"][0]["text"].strip().replace("```json", "").replace("```", "").strip()
+    try:
+        names = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r'\[[\s\S]*?\]', text)
+        if match:
+            names = json.loads(match.group(0))
+        else:
+            raise Exception(f"Resposta inválida: {text[:200]}")
+    if not isinstance(names, list):
+        names = []  # resposta null/vazia: imagem sem painel de party, nenhum nome a extrair
+    return [n.strip() for n in names if isinstance(n, str) and n.strip()]
 
 # ── Atualizar Google Sheets ──────────────────────────────────────
 
