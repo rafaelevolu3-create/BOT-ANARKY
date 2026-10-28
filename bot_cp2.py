@@ -173,17 +173,26 @@ def credit_points(state: dict, name: str, qtd: int):
 
 # ── Extrair nomes via Claude Vision ─────────────────────────────
 
-async def extract_names_from_image(image_bytes: bytes, members: dict) -> list:
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5-5")
+
+def safe_media_type(content_type) -> str:
+    """A API aceita apenas png, jpeg, gif e webp. Qualquer outro valor cai para png."""
+    ct = (content_type or "").split(";")[0].strip().lower()
+    if ct == "image/jpg":
+        ct = "image/jpeg"
+    return ct if ct in ("image/png", "image/jpeg", "image/gif", "image/webp") else "image/png"
+
+async def extract_names_from_image(image_bytes: bytes, members: dict, media_type: str = "image/png") -> list:
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
     roster = list(members.values())
 
     payload = {
-        "model": "claude-sonnet-5",
+        "model": ANTHROPIC_MODEL,
         "max_tokens": 1000,
         "messages": [{
             "role": "user",
             "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": image_b64}},
+                {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": image_b64}},
                 {"type": "text", "text": (
                     "CRITICAL: Your entire response must be ONLY a raw JSON array of strings. "
                     "No explanations, no markdown, no text before or after. Just the array.\n\n"
@@ -207,10 +216,16 @@ async def extract_names_from_image(image_bytes: bytes, members: dict) -> list:
         "content-type": "application/json"
     }
 
+    result = None
     async with aiohttp.ClientSession() as session:
-        async with session.post("https://api.anthropic.com/v1/messages", json=payload, headers=headers) as resp:
-            result = await resp.json()
-            if resp.status != 200:
+        for tentativa in range(4):
+            async with session.post("https://api.anthropic.com/v1/messages", json=payload, headers=headers) as resp:
+                result = await resp.json()
+                if resp.status == 200:
+                    break
+                if resp.status in (429, 500, 502, 503, 504, 529) and tentativa < 3:
+                    await asyncio.sleep(5 * (tentativa + 1))
+                    continue
                 raise Exception(f"API erro {resp.status}: {result.get('error', {}).get('message', str(result))}")
             text = result["content"][0]["text"].strip().replace("```json", "").replace("```", "").strip()
             try:
@@ -270,16 +285,19 @@ async def process_new_messages(channel, state: dict, members: dict, ignorar_curs
 
     events = []
     ultimo_id = after_id
+    cursor_travado = False
 
     async for msg in channel.history(**kwargs):
         if msg.author.bot:
-            ultimo_id = str(msg.id)
+            if not cursor_travado:
+                ultimo_id = str(msg.id)
             continue
 
         msg_id = str(msg.id)
         images = [a for a in msg.attachments if a.content_type and "image" in a.content_type]
         if not images or msg_id in state["processed_messages"]:
-            ultimo_id = msg_id
+            if not cursor_travado:
+                ultimo_id = msg_id
             continue
 
         msg_dt = msg.created_at.replace(tzinfo=timezone.utc).astimezone(BRASILIA_TZ)
@@ -287,14 +305,16 @@ async def process_new_messages(channel, state: dict, members: dict, ignorar_curs
 
         event_names_validos = []
         event_names_ignorados = []
+        event_erros = []
+        creditos = []  # (nome oficial) so aplicados se todas as imagens da mensagem forem lidas sem erro
         ja_pontuados_no_evento = set()  # evita contar 2x o mesmo jogador (ex: aparece como Leader E como Party Member)
 
         for attachment in images:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(attachment.url) as resp:
-                    image_bytes = await resp.read()
             try:
-                names = await extract_names_from_image(image_bytes, members)
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(attachment.url) as resp:
+                        image_bytes = await resp.read()
+                names = await extract_names_from_image(image_bytes, members, safe_media_type(attachment.content_type))
                 excluded = set(state.get("excluded_players", []))
                 for name in names:
                     norm = normalize(name)
@@ -305,10 +325,28 @@ async def process_new_messages(channel, state: dict, members: dict, ignorar_curs
                         continue  # já pontuou nesse mesmo evento, ignora repetição
                     official = members[norm]
                     event_names_validos.append(official)
-                    credit_points(state, official, pts_por_presenca)
+                    creditos.append(official)
                     ja_pontuados_no_evento.add(norm)
             except Exception as e:
                 print(f"[ERRO] {attachment.filename}: {e}")
+                event_erros.append(f"{attachment.filename}: {str(e)[:200]}")
+
+        if event_erros:
+            # Falhou: nao credita nada, nao marca como processada e trava o cursor para tentar de novo no proximo !atualizar
+            cursor_travado = True
+            events.append({
+                "msg_id": msg_id,
+                "date": msg_dt.strftime("%Y-%m-%d %H:%M"),
+                "is_weekend": pts_por_presenca == 2,
+                "pontos_por_presenca": pts_por_presenca,
+                "validos": [],
+                "ignorados": event_names_ignorados,
+                "erros": event_erros
+            })
+            continue
+
+        for official in creditos:
+            credit_points(state, official, pts_por_presenca)
 
         events.append({
             "msg_id": msg_id,
@@ -316,11 +354,13 @@ async def process_new_messages(channel, state: dict, members: dict, ignorar_curs
             "is_weekend": pts_por_presenca == 2,
             "pontos_por_presenca": pts_por_presenca,
             "validos": event_names_validos,
-            "ignorados": event_names_ignorados
+            "ignorados": event_names_ignorados,
+            "erros": []
         })
 
         state["processed_messages"].append(msg_id)
-        ultimo_id = msg_id
+        if not cursor_travado:
+            ultimo_id = msg_id
 
     if ultimo_id:
         state["last_message_id"] = ultimo_id
@@ -333,7 +373,8 @@ def format_update_summary(events: list, state: dict) -> str:
     if not events:
         return "✅ Nenhum evento novo encontrado."
 
-    lines = [f"📊 **{len(events)} evento(s) processado(s)**\n"]
+    falhas = sum(1 for e in events if e.get("erros"))
+    lines = [f"📊 **{len(events)} evento(s) encontrado(s)**" + (f", **{falhas} com falha**" if falhas else "") + "\n"]
     for i, ev in enumerate(events, 1):
         weekend_str = f" 🌟 **{ev['pontos_por_presenca']} pts/presença**" if ev["is_weekend"] else f" ({ev['pontos_por_presenca']} pt/presença)"
         lines.append(f"**Evento {i}** — {ev['date']}{weekend_str}")
@@ -341,6 +382,10 @@ def format_update_summary(events: list, state: dict) -> str:
             lines.append(f"  ✅ Pontuaram: {', '.join(ev['validos'])}")
         if ev["ignorados"]:
             lines.append(f"  ⚠️ Não cadastrados (ignorados): {', '.join(ev['ignorados'])}")
+        for erro in ev.get("erros", []):
+            lines.append(f"  ❌ Falha ao ler imagem, nenhum ponto creditado: {erro}")
+        if ev.get("erros"):
+            lines.append("  🔁 Rode !atualizar de novo para tentar outra vez.")
         lines.append("")
 
     lines.append("```")
@@ -392,7 +437,7 @@ async def on_message(message: discord.Message):
 
     cmd = message.content.strip().lower()
     admin_commands = ("!atualizar", "!forcar", "!resetpontos")
-    admin_prefixes = ("!addpontos ", "!removepontos ", "!removeplayer ", "!addplayer ")
+    admin_prefixes = ("!addpontos ", "!removepontos ", "!removeplayer ", "!addplayer ", "!reprocessar ")
 
     if cmd in admin_commands or cmd.startswith(admin_prefixes):
         if not is_admin(message):
@@ -531,6 +576,30 @@ async def on_message(message: discord.Message):
         await message.channel.send(f"✅ **{name}** readicionado ao ranking (volta a pontuar normalmente e a aparecer na planilha).")
         return
 
+    # !reprocessar N — libera os ultimos N eventos ja processados e le de novo (admin).
+    # Usar somente para eventos que sairam sem pontos por falha. Se o evento ja pontuou, os pontos seriam somados duas vezes.
+    if cmd.startswith("!reprocessar "):
+        try:
+            n = int(cmd.split()[1])
+        except (IndexError, ValueError):
+            await message.channel.send("❌ Uso correto: `!reprocessar quantidade` (ex: `!reprocessar 6`)")
+            return
+        if n < 1 or n > 50:
+            await message.channel.send("❌ Informe uma quantidade entre 1 e 50.")
+            return
+        await message.channel.send(f"⏳ Reprocessando os últimos {n} evento(s)...")
+        try:
+            members = await load_members()
+            state = load_state()
+            state["processed_messages"] = state["processed_messages"][:-n]
+            events = await process_new_messages(message.channel, state, members, ignorar_cursor=True)
+            await update_sheets(state, members)
+            save_state(state)
+            await send_long_message(message.channel, format_update_summary(events, state))
+        except Exception as e:
+            await message.channel.send(f"❌ Erro: {e}")
+        return
+
     # !resetpontos — zera toda a pontuação (admin)
     if cmd == "!resetpontos":
         state = load_state()
@@ -546,7 +615,7 @@ async def on_ready():
     print(f"✅ Bot conectado como {client.user}")
     print(f"📡 Canal: {CHANNEL_ID}")
     print(f"📊 Planilha: {SPREADSHEET_ID}")
-    print(f"💡 Comandos: !atualizar | !forcar | !ranking | !addpontos | !removepontos | !removeplayer | !addplayer | !resetpontos")
+    print(f"💡 Comandos: !atualizar | !forcar | !ranking | !addpontos | !removepontos | !removeplayer | !addplayer | !reprocessar | !resetpontos")
 
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
