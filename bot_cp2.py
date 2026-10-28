@@ -288,6 +288,21 @@ async def update_sheets(state: dict, members: dict):
 
 # ── Processar mensagens novas ────────────────────────────────────
 
+def erro_publico(e: Exception) -> str:
+    """Mensagem de erro segura para exibir no Discord. O texto tecnico completo fica apenas nos logs."""
+    t = str(e).lower()
+    if "credit balance" in t or "billing" in t:
+        return "o serviço de leitura de imagens está sem saldo. Avise o administrador do bot."
+    if "api erro 401" in t or "api erro 403" in t or "authentication" in t or "permission" in t:
+        return "a chave do serviço de leitura de imagens é inválida ou sem permissão. Avise o administrador do bot."
+    if "api erro 429" in t or "rate" in t:
+        return "o limite de uso do serviço de leitura de imagens foi atingido. Tente de novo em alguns minutos."
+    if "api erro 5" in t or "overloaded" in t:
+        return "o serviço de leitura de imagens está indisponível no momento. Tente de novo em alguns minutos."
+    if "resposta inválida" in t:
+        return "a leitura da imagem não retornou nomes em formato válido."
+    return "falha ao ler a imagem (detalhes nos logs do bot)."
+
 async def process_new_messages(channel, state: dict, members: dict, ignorar_cursor: bool = False) -> list:
     """Processa imagens novas e retorna lista de eventos processados."""
     after_id = None if ignorar_cursor else state.get("last_message_id")
@@ -341,7 +356,7 @@ async def process_new_messages(channel, state: dict, members: dict, ignorar_curs
                     ja_pontuados_no_evento.add(norm)
             except Exception as e:
                 print(f"[ERRO] {attachment.filename}: {e}")
-                event_erros.append(f"{attachment.filename}: {str(e)[:200]}")
+                event_erros.append(f"{attachment.filename}: {erro_publico(e)}")
 
         if event_erros:
             # Falhou: nao credita nada, nao marca como processada e trava o cursor para tentar de novo no proximo !atualizar
