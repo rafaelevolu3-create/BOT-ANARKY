@@ -175,8 +175,18 @@ def credit_points(state: dict, name: str, qtd: int):
 
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5-5")
 
-def safe_media_type(content_type) -> str:
-    """A API aceita apenas png, jpeg, gif e webp. Qualquer outro valor cai para png."""
+def safe_media_type(content_type, image_bytes: bytes = b"") -> str:
+    """Descobre o tipo real da imagem pelos primeiros bytes do arquivo (o Discord pode informar um tipo diferente do real).
+    So se os bytes nao forem reconhecidos usa o tipo informado. A API aceita png, jpeg, gif e webp."""
+    head = image_bytes[:12]
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if head.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if head.startswith(b"GIF87a") or head.startswith(b"GIF89a"):
+        return "image/gif"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
     ct = (content_type or "").split(";")[0].strip().lower()
     if ct == "image/jpg":
         ct = "image/jpeg"
@@ -236,6 +246,8 @@ async def extract_names_from_image(image_bytes: bytes, members: dict, media_type
                     names = json.loads(match.group(0))
                 else:
                     raise Exception(f"Resposta inválida: {text[:200]}")
+            if not isinstance(names, list):
+                names = []  # resposta null/vazia: imagem sem painel de party, nenhum nome a extrair
             return [n.strip() for n in names if isinstance(n, str) and n.strip()]
 
 # ── Atualizar Google Sheets ──────────────────────────────────────
@@ -314,7 +326,7 @@ async def process_new_messages(channel, state: dict, members: dict, ignorar_curs
                 async with aiohttp.ClientSession() as session:
                     async with session.get(attachment.url) as resp:
                         image_bytes = await resp.read()
-                names = await extract_names_from_image(image_bytes, members, safe_media_type(attachment.content_type))
+                names = await extract_names_from_image(image_bytes, members, safe_media_type(attachment.content_type, image_bytes))
                 excluded = set(state.get("excluded_players", []))
                 for name in names:
                     norm = normalize(name)
@@ -382,8 +394,12 @@ def format_update_summary(events: list, state: dict) -> str:
             lines.append(f"  ✅ Pontuaram: {', '.join(ev['validos'])}")
         if ev["ignorados"]:
             lines.append(f"  ⚠️ Não cadastrados (ignorados): {', '.join(ev['ignorados'])}")
+        agrupados = {}
         for erro in ev.get("erros", []):
-            lines.append(f"  ❌ Falha ao ler imagem, nenhum ponto creditado: {erro}")
+            motivo = erro.split(": ", 1)[1] if ": " in erro else erro
+            agrupados[motivo] = agrupados.get(motivo, 0) + 1
+        for motivo, qtd in agrupados.items():
+            lines.append(f"  ❌ {qtd} imagem(ns) com falha, nenhum ponto creditado: {motivo[:250]}")
         if ev.get("erros"):
             lines.append("  🔁 Rode !atualizar de novo para tentar outra vez.")
         lines.append("")
