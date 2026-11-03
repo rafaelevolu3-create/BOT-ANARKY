@@ -484,27 +484,38 @@ def is_admin(message: discord.Message) -> bool:
     return any(role.name == ADMIN_ROLE_NAME for role in message.author.roles)
 
 async def send_long_message(channel, text: str, limite: int = 1900):
-    """Envia texto longo em vários blocos, respeitando o limite de 2000 caracteres do Discord."""
+    """Envia texto longo em varias mensagens (limite de 2000 do Discord). Se um bloco de codigo (```) ficar aberto
+    no fim de uma parte, fecha nela e reabre na proxima, para nao quebrar a formatacao."""
     if len(text) <= limite:
         await channel.send(text)
         return
 
-    linhas = text.split("\n")
-    bloco = ""
-    for linha in linhas:
-        # Se uma linha sozinha já for maior que o limite, corta ela também
-        while len(linha) > limite:
-            await channel.send(linha[:limite])
-            linha = linha[limite:]
-
-        if len(bloco) + len(linha) + 1 > limite:
-            await channel.send(bloco)
+    reserva = 8  # espaco para fechar/reabrir o bloco
+    max_linha = limite - reserva
+    partes, bloco = [], ""
+    for linha in text.split("\n"):
+        while len(linha) > max_linha:
+            if bloco:
+                partes.append(bloco)
+                bloco = ""
+            partes.append(linha[:max_linha])
+            linha = linha[max_linha:]
+        if len(bloco) + len(linha) + 1 > max_linha:
+            partes.append(bloco)
             bloco = linha
         else:
             bloco = f"{bloco}\n{linha}" if bloco else linha
-
     if bloco:
-        await channel.send(bloco)
+        partes.append(bloco)
+
+    aberto = False
+    for parte in partes:
+        if aberto:
+            parte = "```\n" + parte
+        aberto = parte.count("```") % 2 == 1
+        if aberto:
+            parte = parte + "\n```"
+        await channel.send(parte)
 
 @client.event
 async def on_message(message: discord.Message):
