@@ -5,6 +5,8 @@ import json
 import base64
 import re
 import os
+import io
+import traceback
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
@@ -192,6 +194,32 @@ def safe_media_type(content_type, image_bytes: bytes = b"") -> str:
         ct = "image/jpeg"
     return ct if ct in ("image/png", "image/jpeg", "image/gif", "image/webp") else "image/png"
 
+def preparar_imagem(image_bytes: bytes):
+    """Reduz imagens grandes demais (acima de ~4,5 MB ou lado maior que 7000 px). Retorna (bytes, media_type) ou None se nao precisar."""
+    try:
+        from PIL import Image
+    except Exception:
+        return None
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        w, h = img.size
+        if len(image_bytes) <= 4_500_000 and max(w, h) <= 7000:
+            return None
+        img = img.convert("RGB")
+        lado = 3000
+        while lado >= 1000:
+            c = img.copy()
+            c.thumbnail((lado, lado))
+            for q in (90, 80, 70):
+                buf = io.BytesIO()
+                c.save(buf, "JPEG", quality=q)
+                if buf.tell() <= 4_500_000:
+                    return buf.getvalue(), "image/jpeg"
+            lado -= 500
+    except Exception as e:
+        print(f"[AVISO] nao foi possivel reduzir a imagem: {e}")
+    return None
+
 async def extract_names_from_image(image_bytes: bytes, members: dict, media_type: str = "image/png") -> list:
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
     roster = list(members.values())
@@ -301,7 +329,13 @@ def erro_publico(e: Exception) -> str:
         return "o serviço de leitura de imagens está indisponível no momento. Tente de novo em alguns minutos."
     if "resposta inválida" in t:
         return "a leitura da imagem não retornou nomes em formato válido."
-    return "falha ao ler a imagem (detalhes nos logs do bot)."
+    if "image exceeds" in t or "too large" in t or "5 mb" in t or "dimensions" in t or "image size" in t:
+        return "a imagem é grande demais para ser lida. Envie um print menor."
+    if "download da imagem" in t:
+        return "não foi possível baixar a imagem do Discord. Tente de novo."
+    if isinstance(e, asyncio.TimeoutError) or "timeout" in t or "timed out" in t:
+        return "a leitura demorou demais. Tente de novo."
+    return f"falha ao ler a imagem (código {type(e).__name__}, detalhes nos logs do bot)."
 
 async def process_new_messages(channel, state: dict, members: dict, ignorar_cursor: bool = False) -> list:
     """Processa imagens novas e retorna lista de eventos processados."""
@@ -341,7 +375,14 @@ async def process_new_messages(channel, state: dict, members: dict, ignorar_curs
                 async with aiohttp.ClientSession() as session:
                     async with session.get(attachment.url) as resp:
                         image_bytes = await resp.read()
-                names = await extract_names_from_image(image_bytes, members, safe_media_type(attachment.content_type, image_bytes))
+                if resp.status != 200 or not image_bytes:
+                    raise RuntimeError(f"download da imagem falhou (HTTP {resp.status}, {len(image_bytes)} bytes)")
+                mt = safe_media_type(attachment.content_type, image_bytes)
+                prep = preparar_imagem(image_bytes)
+                if prep:
+                    print(f"[INFO] {attachment.filename}: imagem reduzida de {len(image_bytes)} bytes")
+                    image_bytes, mt = prep
+                names = await extract_names_from_image(image_bytes, members, mt)
                 excluded = set(state.get("excluded_players", []))
                 for name in names:
                     norm = normalize(name)
@@ -355,7 +396,8 @@ async def process_new_messages(channel, state: dict, members: dict, ignorar_curs
                     creditos.append(official)
                     ja_pontuados_no_evento.add(norm)
             except Exception as e:
-                print(f"[ERRO] {attachment.filename}: {e}")
+                print(f"[ERRO] {attachment.filename}: {type(e).__name__}: {e}")
+                traceback.print_exc()
                 event_erros.append(f"{attachment.filename}: {erro_publico(e)}")
 
         if event_erros:

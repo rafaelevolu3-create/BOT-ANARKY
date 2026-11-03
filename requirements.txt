@@ -3,3 +3,4 @@ aiohttp
 cryptography
 anthropic
 python-dotenv
+Pillow
