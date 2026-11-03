@@ -226,7 +226,7 @@ async def extract_names_from_image(image_bytes: bytes, members: dict, media_type
 
     payload = {
         "model": ANTHROPIC_MODEL,
-        "max_tokens": 1000,
+        "max_tokens": 4000,
         "messages": [{
             "role": "user",
             "content": [
@@ -265,7 +265,12 @@ async def extract_names_from_image(image_bytes: bytes, members: dict, media_type
                     await asyncio.sleep(5 * (tentativa + 1))
                     continue
                 raise Exception(f"API erro {resp.status}: {result.get('error', {}).get('message', str(result))}")
-    text = result["content"][0]["text"].strip().replace("```json", "").replace("```", "").strip()
+    blocos = result.get("content") or []
+    text = "".join(b.get("text", "") for b in blocos if isinstance(b, dict) and b.get("type") == "text")
+    if not text.strip():
+        print(f"[DEBUG] resposta sem texto. stop_reason={result.get('stop_reason')} tipos={[b.get('type') for b in blocos if isinstance(b, dict)]} bruto={str(result)[:600]}")
+        raise RuntimeError("resposta inválida: a leitura da imagem voltou sem texto")
+    text = text.strip().replace("```json", "").replace("```", "").strip()
     try:
         names = json.loads(text)
     except json.JSONDecodeError:
